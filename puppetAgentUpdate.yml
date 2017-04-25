@@ -47,4 +47,3 @@
     register: verifyMigration
   - debug:
       msg: "Puppet migration completed {{ verifyMigration.stdout }}"
-Read more at http://nixkb.info/?p=1854#CjlVsyih7wvyf6vR.99
