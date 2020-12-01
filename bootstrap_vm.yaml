@@ -1,0 +1,181 @@
+#author : dpathak@dtis.com
+##Version : 1.0.1
+- name: Bootstraping VM(s)
+  become_method: sudo
+  gather_facts: no
+  hosts: dynamicui
+  serial: 1
+  vars_files:
+    - Answer_file
+    - Vault_file.yml
+  remote_user: dtisadmin
+  become: true
+
+###############################################
+  tasks:
+###############################################
+    - name: Remove repository from a specific repo file
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_fileglob:
+        - "/etc/yum.repos.d/*"
+    - name: Copy repo file
+      copy:
+        src: dtis.repo
+        dest: /etc/yum.repos.d/dtis.repo
+        owner: root
+        group: root
+        mode: 0644
+    - name: Add sudoers groups for devops
+      lineinfile:
+        dest: /etc/sudoers.d/devops
+        line: "%devops ALL=(ALL) NOPASSWD: ALL"
+        create: yes
+      ignore_errors: true
+      tags: sudoers
+    - name: Remove firewalld
+      yum:
+        name: firewalld
+        state: absent
+    - name: Install the iptables package
+      yum:
+        name: iptables
+        state: latest
+      tags: pkgs
+    - name: Install the iptables-service package
+      yum:
+        name: iptables-services.x86_64
+        state: latest
+      tags: svcs
+    - name: Flush existing firewall rules
+      iptables:
+        flush: true
+      tags: flush
+    - name: update the system
+      yum:
+        name: "*"
+        state: latest
+    - name: Reboot box if kernel/libs updated and requested by the system
+      shell: sleep 10 && /sbin/shutdown -r now 'Rebooting box to update system libs/kernel as needed' 
+      args:
+        removes: /var/run/reboot-required
+      async: 300
+      poll: 0
+      ignore_errors: true
+    - name: wait for 10 seconds
+      pause:
+        seconds: 10
+      tags: pause
+    - name: wait for the system to reboot
+      wait_for_connection:
+        connect_timeout: 20
+        sleep: 5
+        delay: 5
+        timeout: 60
+      tags: wconn
+    - name: install supporting packages for ActiveDirectory and expect
+      yum: 
+        name: "{{ packages }}"
+      vars:
+        packages:
+        - realmd
+        - samba
+        - samba-common
+        - oddjob
+        - oddjob-mkhomedir
+        - sssd
+        - ntpdate
+        - ntp
+        - adcli
+        - samba-common-tools
+        - python-pip
+        - libselinux-python
+        - java
+        - cifs-utils
+
+###############################################
+    - name: Turn off SELinux
+      shell: setenforce=0
+###############################################
+    - name: Install expect
+      pip:
+        name: pexpect
+###############################################
+    - name: discover realm
+      shell: /bin/bash -c "/usr/sbin/realm discover dtis.com"
+
+###############################################
+    - name: join system to ActiveDirectory
+      expect:
+        command: /bin/bash -c "/sbin/realm join --user=ldap dtis.com"
+        responses:
+          Password for ldap: "{{ ldap_pass }}"
+      ignore_errors: true
+
+###############################################
+    - name: Allow Password Auth for all users except root
+      lineinfile: 
+        backup: yes
+        state: present
+        dest: /etc/ssh/sshd_config
+        regexp: '^{{ item.search }}'
+        line: '{{ item.replace }}'
+      with_items:      
+        - { search: 'PasswordAuthentication', replace: 'PasswordAuthentication yes' }
+
+###############################################
+    - name: Allow User Login without FQDN
+      lineinfile:
+        backup: yes
+        state: present
+        dest: /etc/sssd/sssd.conf
+        regexp: '^{{ item.search }}'
+        line: '{{ item.replace }}'
+      with_items:
+        - { search: 'use_fully_qualified_names', replace: 'use_fully_qualified_names = False' }
+      ignore_errors: true
+
+    - include_vars: users.yml
+    - name: Creating devops_users to Remote Server
+      user:
+         name: "{{ item.username }}" 
+         groups: "devops"
+      with_items: "{{ devops_users }}"
+
+    - name: Creating dev_users to Remote Server
+      user: 
+        name: "{{ item.username }}" 
+        groups: "developers_intacct"
+      with_items: "{{ dev_users }}"
+
+    - name: Placing SSH Key to Authorized Key
+      authorized_key: user="{{item.username}}" key="{{ lookup('file', './keyfiles/authorized_keys.{{ item.username}}.pub')}}"
+      with_items: 
+        - "{{ devops_users }}"
+        - "{{ dev_users }}"
+
+    - name: Changing devops group
+      command: chgrp -R devops /home/{{ item.username }}
+      with_items:
+        - "{{ devops_users }}"
+      ignore_errors: true
+
+    - name: Allow specified groups to sudo
+      template:
+        src: devops
+        dest: /etc/sudoers.d/devops
+        validate: 'visudo -cf %s'
+        mode: 0440
+
+    - name: Disallow root SSH access
+      lineinfile: dest=/etc/ssh/sshd_config
+              regexp="^PermitRootLogin"
+              line="PermitRootLogin no"
+              state=present
+
+    - name: restart sshd
+      command: systemctl restart sshd
+
+    - name: restart sssd
+      command: systemctl restart sssd
